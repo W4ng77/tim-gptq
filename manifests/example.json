@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "dataset_id": "provider/dataset",
+  "dataset_alias": "example-split",
+  "split": "test",
+  "source_url": "https://example.invalid/dataset",
+  "seed": 20260729,
+  "total_rows": 1,
+  "num_selected": 1,
+  "selected": [
+    {
+      "id": "example-0001",
+      "audio_path": "data/example-0001.wav",
+      "text": "REFERENCE TRANSCRIPT",
+      "language": "English"
+    }
+  ]
+}

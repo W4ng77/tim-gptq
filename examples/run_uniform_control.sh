@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GPU_ID=${GPU_ID:-0}
+OUTPUT_DIR=${OUTPUT_DIR:-runs}
+CALIBRATION_SEED=${CALIBRATION_SEED:-20260729}
+
+CUDA_VISIBLE_DEVICES="$GPU_ID" python implementations/whisper_qwen/src/asr_experiment.py \
+  --model whisper-large-v3 \
+  --mode gptq \
+  --quant-scope encoder \
+  --wbits 2 --groupsize 128 \
+  --nsamples 128 --calib-batch-size 16 \
+  --seed "$CALIBRATION_SEED" --quantization-seed 20260729 \
+  --frame-weighting none \
+  --eval --eval-samples -1 \
+  --output-dir "$OUTPUT_DIR" \
+  --run-name "uniform-whisper-large-v3-w2-c${CALIBRATION_SEED}"
+
