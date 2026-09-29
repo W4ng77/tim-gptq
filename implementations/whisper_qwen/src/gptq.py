@@ -11,6 +11,7 @@ import transformers
 
 from quant import Quantizer, quantize
 from rotation import build_rotation
+import fp4_formats
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -157,9 +158,22 @@ class Helper:
         rotate: str = "none",
         rotation_seed: int = 0,
         rotation_tag: str = "",
+        fp4_format: str | None = None,
     ):
         quantizer = Quantizer()
         quantizer.configure(wbits, perchannel=True, sym=False, mse=False)
+        # FP4 block formats replace ONLY the quantization operator (group scale
+        # search + per-column rounding); the Gram, Cholesky, ordering and error
+        # compensation below are untouched. The group size is the format's
+        # block size along the contracting (column) dimension.
+        fp4_scale = None
+        fp4_tensor_scale = None
+        if fp4_format is not None:
+            if fp4_format not in ("mxfp4", "nvfp4"):
+                raise ValueError(f"Unsupported FP4 format: {fp4_format!r}")
+            if wbits != 4:
+                raise ValueError("FP4 formats require wbits=4 (E2M1 elements).")
+            groupsize = fp4_formats.block_size(fp4_format)
 
         weights = layer.weight.detach().clone()
         if isinstance(layer, nn.Conv2d):
@@ -199,6 +213,12 @@ class Helper:
             if cross_hessian is not None:
                 cross_hessian = rotation.t() @ cross_hessian @ rotation
 
+        if fp4_format == "nvfp4":
+            fp4_tensor_scale = fp4_formats.nvfp4_tensor_scale(weights)
+        if fp4_format is not None and weights.shape[1] % groupsize != 0:
+            raise ValueError(
+                f"FP4 block size {groupsize} does not divide the contracting dim {weights.shape[1]}."
+            )
         if not quantizer.ready():
             quantizer.find_params(weights, weight=True)
 
@@ -251,17 +271,29 @@ class Helper:
                 global_column = block_start + column
 
                 if groupsize != -1 and global_column % groupsize == 0:
-                    quantizer.find_params(
-                        weights[:, global_column : global_column + groupsize],
-                        weight=True,
-                    )
+                    if fp4_format is not None:
+                        fp4_scale = fp4_formats.block_scales(
+                            weights[:, global_column : global_column + groupsize],
+                            fp4_format,
+                            fp4_tensor_scale,
+                        )
+                    else:
+                        quantizer.find_params(
+                            weights[:, global_column : global_column + groupsize],
+                            weight=True,
+                        )
 
-                quantized_column = quantize(
-                    weight_column.unsqueeze(1),
-                    quantizer.scale,
-                    quantizer.zero,
-                    quantizer.maxq,
-                ).flatten()
+                if fp4_format is not None:
+                    quantized_column = fp4_formats.fake_quant_column(
+                        weight_column, fp4_scale
+                    )
+                else:
+                    quantized_column = quantize(
+                        weight_column.unsqueeze(1),
+                        quantizer.scale,
+                        quantizer.zero,
+                        quantizer.maxq,
+                    ).flatten()
                 block_quantized[:, column] = quantized_column
 
                 error = (weight_column - quantized_column) / diagonal

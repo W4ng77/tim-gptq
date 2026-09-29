@@ -21,6 +21,9 @@ change the saved weight layout.
   bootstrap programs used by the paper.
 - `examples`: reproducible command templates for the principal method and its
   identification controls.
+- `rebuttal_experiments`: code for the author-response experiments added after
+  submission (RSQ attention-concentration Density control, a machine-translation
+  existence check, and MXFP4/NVFP4 fake quantization inside the GPTQ solver).
 - `manifests`: schema example and instructions for materializing evaluation
   audio locally. Audio, model weights, caches, and predictions are not bundled.
 
@@ -95,7 +98,15 @@ python -m pytest -q implementations/whisper_qwen/tests/test_protocol.py
 python -m pytest -q implementations/voxtral/tests/test_protocol.py
 ```
 
-The packaged snapshots pass 77 and 66 tests, respectively. See
+The packaged snapshots pass 77 and 66 tests, respectively. The FP4 format
+tests added for the author response run with
+
+```bash
+python -m pytest -q implementations/whisper_qwen/tests/test_fp4_formats.py
+```
+
+(12 tests; the three reference comparisons are skipped unless
+`compressed-tensors` is installed). See
 `REPRODUCIBILITY.md` for claim-to-code and analysis mappings.
 
 ## Scope of the anonymous artifact

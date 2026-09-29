@@ -951,6 +951,154 @@ def _qwen_scope_includes_group(scope, stack, group):
     return False
 
 
+def _qwen_rsq_causal_additive_mask(length, dtype, device):
+    """Explicit additive causal mask for one unpadded sequence (eager kernel)."""
+    min_value = torch.finfo(dtype).min
+    mask = torch.full((length, length), min_value, dtype=dtype, device=device)
+    mask = torch.triu(mask, diagonal=1)
+    return mask[None, None, :, :]
+
+
+@torch.no_grad()
+def _qwen_rsq_attention_concentration(layer, sample, dev):
+    """RSQ attention-concentration score for one cached text-layer input.
+
+    Matched control for the reviewer's RSQ comparison (Sung et al., 2025,
+    Sec. 4.3; official ``OriginalAttentionWeighting`` in
+    ``fake_quant/input_weighting_module.py``): run the *current* layer's
+    self-attention on the layer input from the sequential (quantized-so-far)
+    stream, take the post-softmax probabilities ``A`` of shape
+    ``(batch, heads, queries, keys)``, and score key token ``j`` by
+    ``sum_{heads m} sum_{queries i} A[m, i, j]`` (mean over the size-one
+    batch).  The probabilities are materialized with the eager kernel under
+    an explicit causal mask, because fused kernels return ``None`` weights and
+    the cached mask may be ``None`` on the fused path.
+    """
+    captured = {}
+
+    def hook(_module, _inputs, output):
+        if isinstance(output, (tuple, list)) and len(output) > 1:
+            captured["attn"] = output[1]
+
+    x = sample["hidden_states"].to(dev)
+    if x.ndim != 3 or x.shape[0] != 1:
+        raise ValueError(
+            "RSQ attention concentration expects one unpadded sequence per "
+            f"sample; got hidden_states of shape {tuple(x.shape)}."
+        )
+    config = layer.self_attn.config
+    previous_impl = config._attn_implementation
+    handle = layer.self_attn.register_forward_hook(hook)
+    try:
+        config._attn_implementation = "eager"
+        kw = _qwen_text_kw_from_cache(sample, dev)
+        kw["attention_mask"] = _qwen_rsq_causal_additive_mask(
+            x.shape[1], x.dtype, dev
+        )
+        _qwen_run_text_layer(layer, x, kw)
+    finally:
+        config._attn_implementation = previous_impl
+        handle.remove()
+    attn = captured.get("attn")
+    if attn is None:
+        raise RuntimeError(
+            "Eager self-attention did not return attention probabilities."
+        )
+    attn = attn.detach().float()
+    if attn.ndim != 4 or attn.shape[-1] != x.shape[1] or attn.shape[-2] != x.shape[1]:
+        raise RuntimeError(
+            f"Unexpected attention shape {tuple(attn.shape)} for {x.shape[1]} tokens."
+        )
+    row_sum_deviation = float((attn.sum(dim=-1) - 1.0).abs().max())
+    # RSQ: sum over heads, then over query positions, mean over the batch axis.
+    score = attn.sum(dim=1).sum(dim=1).mean(dim=0)
+    return score, int(attn.shape[1]), row_sum_deviation
+
+
+def _qwen_rsq_native_weights(score, min_value, max_value):
+    """RSQ native scaling: linear map of the raw score to ``[min, max]`` with a
+    clamp (``InputWeightingModule.normalize_weight``), followed by the
+    per-sample unit-mean renormalization the official GPTQ ``add_batch``
+    applies before multiplying the inputs by ``sqrt(weighting)``."""
+    s = score.detach().float().reshape(-1)
+    if not bool(torch.isfinite(s).all()):
+        raise ValueError("RSQ attention score is not finite.")
+    s_min = float(s.min())
+    s_max = float(s.max())
+    if s_max - s_min <= 0.0:
+        r = torch.full_like(s, float(max_value))
+        degenerate = True
+    else:
+        r = (s - s_min) / (s_max - s_min) * (max_value - min_value) + min_value
+        r = r.clamp(min_value, max_value)
+        degenerate = False
+    w = r / r.sum() * r.numel()
+    return w, degenerate
+
+
+@torch.no_grad()
+def _qwen_rsq_attention_layer_weights(layer, cache_q, dev, args):
+    """Per-sample Gram row weights for one text layer from the RSQ score."""
+    mode = str(getattr(args, "rsq_score_normalization", "native"))
+    min_value = float(getattr(args, "rsq_min_value", 0.1))
+    max_value = float(getattr(args, "rsq_max_value", 1.0))
+    clip_max = float(getattr(args, "propagated_clip_max", 2.0))
+    weights = []
+    summary = {
+        "samples": 0,
+        "tokens": 0,
+        "heads": None,
+        "raw_score_min": float("inf"),
+        "raw_score_max": 0.0,
+        "raw_score_sum": 0.0,
+        "weight_min": float("inf"),
+        "weight_max": 0.0,
+        "weight_sum": 0.0,
+        "ess_fraction_sum": 0.0,
+        "saturated_upper": 0,
+        "degenerate_samples": 0,
+        "max_attention_row_sum_deviation": 0.0,
+    }
+    for sample in cache_q:
+        score, heads, deviation = _qwen_rsq_attention_concentration(
+            layer, sample, dev
+        )
+        if mode == "native":
+            w, degenerate = _qwen_rsq_native_weights(score, min_value, max_value)
+            upper = float(w.max())
+            saturated = int((w >= upper - 1e-12).sum()) if not degenerate else 0
+        elif mode == "bounded-kl":
+            w = _normalize_qwen_sequence_token_weights(score, clip_max=clip_max)
+            degenerate = False
+            saturated = int((w >= clip_max - 1e-6).sum())
+        else:
+            raise ValueError(f"Unsupported RSQ score normalization: {mode!r}.")
+        w = w.detach().float().reshape(-1)
+        weights.append(w.cpu())
+        summary["samples"] += 1
+        summary["tokens"] += int(w.numel())
+        summary["heads"] = heads
+        summary["raw_score_min"] = min(summary["raw_score_min"], float(score.min()))
+        summary["raw_score_max"] = max(summary["raw_score_max"], float(score.max()))
+        summary["raw_score_sum"] += float(score.sum())
+        summary["weight_min"] = min(summary["weight_min"], float(w.min()))
+        summary["weight_max"] = max(summary["weight_max"], float(w.max()))
+        summary["weight_sum"] += float(w.sum())
+        summary["ess_fraction_sum"] += float(1.0 / (1.0 + w.sub(1.0).square().mean()))
+        summary["saturated_upper"] += saturated
+        summary["degenerate_samples"] += int(degenerate)
+        summary["max_attention_row_sum_deviation"] = max(
+            summary["max_attention_row_sum_deviation"], deviation
+        )
+    tokens = max(summary["tokens"], 1)
+    samples = max(summary["samples"], 1)
+    summary["raw_score_mean"] = summary.pop("raw_score_sum") / tokens
+    summary["weight_mean"] = summary.pop("weight_sum") / tokens
+    summary["ess_fraction_mean"] = summary.pop("ess_fraction_sum") / samples
+    summary["saturated_upper_fraction"] = summary.pop("saturated_upper") / tokens
+    return weights, summary
+
+
 def _qwen_gptq_weight(
     helper,
     layer,
@@ -985,6 +1133,10 @@ def _qwen_gptq_weight(
             perccorr=alpha,
         )
     rotate = str(getattr(args, "rotate", "none"))
+    fp4_format = getattr(args, "fp4_format", None)
+    if fp4_format in (None, "", "none"):
+        fp4_format = None
+    original = module.weight.detach().float().clone()
     weight = helper.run_gptq(
         module,
         percdamp=args.percdamp,
@@ -1000,9 +1152,24 @@ def _qwen_gptq_weight(
         rotate=rotate,
         rotation_seed=int(getattr(args, "rotation_seed", 0)),
         rotation_tag=full_name,
+        fp4_format=fp4_format,
     )
     if rotate != "none":
         _record_rotation_module(args, full_name, int(module.weight.shape[1]))
+    # numerical reconstruction error ||W - Q(W)||_F^2 of the GPTQ output
+    err = float((original - weight.detach().float()).pow(2).sum())
+    stats = getattr(args, "_reconstruction_stats", None)
+    if stats is None:
+        stats = {"per_module": {}, "sum_sq_error": 0.0, "sum_sq_weight": 0.0, "numel": 0}
+        args._reconstruction_stats = stats
+    stats["per_module"][full_name] = {
+        "sq_error": err,
+        "sq_weight": float(original.pow(2).sum()),
+        "numel": int(original.numel()),
+    }
+    stats["sum_sq_error"] += err
+    stats["sum_sq_weight"] += float(original.pow(2).sum())
+    stats["numel"] += int(original.numel())
     return weight
 
 
@@ -1271,6 +1438,24 @@ def _qwen_quantize_cached_sequential(
             fp_layer = None
             if fp_thinker is not None:
                 fp_layer = fp_thinker.model.layers[lid].to(dev).eval()
+            if bool(getattr(args, "rsq_attention", False)) and not collect_scores_only:
+                # Matched RSQ attention-concentration Density control: score the
+                # current (not yet quantized) layer on its sequential input,
+                # exactly where the official RSQ loop computes batch_weighting.
+                rsq_weights, rsq_summary = _qwen_rsq_attention_layer_weights(
+                    layer, cache_q, dev, args
+                )
+                store = getattr(args, "_qwen_sequence_token_weights", None)
+                if store is None:
+                    store = {}
+                    args._qwen_sequence_token_weights = store
+                store[f"thinker.model.layers.{lid}"] = rsq_weights
+                metadata = getattr(args, "_quantization_metadata", {})
+                record = metadata.setdefault("rsq_attention_control", {})
+                record.setdefault("layer_weight_summaries", {})[
+                    f"thinker.model.layers.{lid}"
+                ] = rsq_summary
+                args._quantization_metadata = metadata
             layer_local_names = []
             for group in QWEN_TEXT_GROUPS:
                 if not _qwen_scope_includes_group(quant_scope, "text", group):
