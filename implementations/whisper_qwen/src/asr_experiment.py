@@ -99,6 +99,7 @@ MODES = (
     "gptq+seqhess",
     "gptq+prophess",
     "gptq+boundaryguard",
+    "gptq+rsqattn",
 )
 
 
@@ -330,6 +331,45 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fp4-format",
+        choices=("none", "mxfp4", "nvfp4"),
+        default="none",
+        help=(
+            "Replace the integer group quantizer inside GPTQ by a software "
+            "FP4 block fake-quantizer: 'mxfp4' (E2M1, block 32, E8M0 scale) or "
+            "'nvfp4' (E2M1, block 16, E4M3 block scale, FP32 tensor scale; 1-D "
+            "numerical emulation). Requires --wbits 4; the group size is the "
+            "format block size. Gram, ordering and error compensation unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--rsq-score-normalization",
+        choices=("native", "bounded-kl"),
+        default="native",
+        help=(
+            "gptq+rsqattn only (matched RSQ attention-concentration Density "
+            "control on the Qwen text backbone). 'native' applies RSQ's own "
+            "linear map of the raw attention-concentration score to "
+            "[--rsq-min-value, --rsq-max-value] with clamp and the official "
+            "unit-mean renormalization; 'bounded-kl' passes the identical raw "
+            "score through the same ratio-preserving KL/I-projection used by "
+            "gptq+seqhess (final weights in [1e-4, --propagated-clip-max], "
+            "unit mean)."
+        ),
+    )
+    parser.add_argument(
+        "--rsq-min-value",
+        type=float,
+        default=0.1,
+        help="RSQ native scaling lower bound r_min (RSQ reports 0.1 optimal without rotation).",
+    )
+    parser.add_argument(
+        "--rsq-max-value",
+        type=float,
+        default=1.0,
+        help="RSQ native scaling upper bound r_max (RSQ fixes 1).",
+    )
+    parser.add_argument(
         "--calib-augment",
         choices=("none", "acoustic"),
         default="none",
@@ -525,6 +565,7 @@ def resolve_mode(args) -> None:
     args.propagation_hessian = args.mode == "gptq+prophess"
     args.dynamic_alpha = args.mode == "gptq+dynamic-alpha"
     args.boundaryguard = args.mode == "gptq+boundaryguard"
+    args.rsq_attention = args.mode == "gptq+rsqattn"
     args.int_zero_point = True
     args.encoder_promote_layer_indices = tuple(
         sorted(
@@ -694,6 +735,10 @@ _WHISPER_ENCODER_CONFIG_KEYS = (
 
 def _encoder_state_sidecar_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.metadata.json")
+
+
+def _source_file_sha256(name: str) -> str:
+    return _file_sha256(Path(__file__).resolve().parent / name)
 
 
 def _file_sha256(path: Path) -> str:
@@ -1047,11 +1092,66 @@ def _quantize_qwen(model, args) -> list[str]:
         include_labels=(
             args.sequence_hessian
             or args.sequence_calibration
+            or bool(getattr(args, "rsq_attention", False))
             or getattr(args, "frame_weighting", "none") == "task-fisher"
         ),
     )
     if args.score_calibration_wer:
         args._calibration_data_for_scoring = calibration_data
+    if bool(getattr(args, "rsq_attention", False)):
+        for sample in calibration_data:
+            mask = sample.get("attention_mask")
+            if mask is not None and not bool(mask.bool().all()):
+                raise ValueError(
+                    "RSQ attention-concentration control requires unpadded "
+                    "single-sequence calibration samples."
+                )
+        mode = str(getattr(args, "rsq_score_normalization", "native"))
+        metadata = getattr(args, "_quantization_metadata", {})
+        record = metadata.setdefault("rsq_attention_control", {})
+        record.update(
+            {
+                "arm": "matched RSQ attention-concentration Density control",
+                "not_full_rsq": (
+                    "reproduces only RSQ's token-importance score and, for "
+                    "'native', its score scaling; no rotation, no RSQ "
+                    "calibration corpus, no w_clip/asymmetric search"
+                ),
+                "score": (
+                    "s_j = sum_{heads m} sum_{queries i} A^{(l)}[m, i, j] where "
+                    "A^{(l)} is the post-softmax self-attention of the current "
+                    "text layer l evaluated on its own sequential "
+                    "(quantized-so-far) input with an explicit causal mask; "
+                    "Sung et al. 2025 Sec. 4.3 / OriginalAttentionWeighting"
+                ),
+                "score_normalization": mode,
+                "normalization": (
+                    "RSQ native: r = clamp((s - min s) / (max s - min s) * "
+                    f"({float(args.rsq_max_value):g} - {float(args.rsq_min_value):g}) "
+                    f"+ {float(args.rsq_min_value):g}, {float(args.rsq_min_value):g}, "
+                    f"{float(args.rsq_max_value):g}); w = r / mean(r) "
+                    "(official add_batch renormalization)"
+                    if mode == "native"
+                    else (
+                        "TIM Qwen path: ratio-preserving KL/I-projection of the "
+                        "raw score s to unit mean with final weights in "
+                        f"[1e-4, {float(args.propagated_clip_max):g}] "
+                        "(_normalize_qwen_sequence_token_weights)"
+                    )
+                ),
+                "rsq_min_value": float(args.rsq_min_value),
+                "rsq_max_value": float(args.rsq_max_value),
+                "hessian": "2 * X.T * diag(w) * X, accumulated by the unchanged Helper.add_batch",
+                "support": "full teacher-forced prompt+transcript rows (deployment template)",
+                "citation": (
+                    "Sung, Yadav, Li, Yoon, Bansal. RSQ: Learning from Important "
+                    "Tokens Leads to Better Quantized LLMs. arXiv:2503.01820; "
+                    "github.com/ylsung/rsq (fake_quant/input_weighting_module.py, "
+                    "fake_quant/gptq_utils.py)"
+                ),
+            }
+        )
+        args._quantization_metadata = metadata
     sequence_support = str(getattr(args, "sequence_support", "full"))
     if sequence_support != "full":
         if not (args.sequence_hessian or args.sequence_calibration):
@@ -2175,6 +2275,45 @@ def quantize_model(model, processor, spec, args) -> list[str]:
             )
         if args.propagation_hessian_probes <= 0:
             raise ValueError("--propagation-hessian-probes must be positive.")
+    if getattr(args, "fp4_format", "none") != "none":
+        if args.method != "gptq":
+            raise ValueError("--fp4-format requires a GPTQ-derived mode.")
+        if int(args.wbits) != 4:
+            raise ValueError("--fp4-format requires --wbits 4 (E2M1 elements).")
+        if bool(getattr(args, "qep", False)) or bool(getattr(args, "gptaq", False)):
+            raise ValueError("--fp4-format is incompatible with dual-stream statistics modes.")
+        if str(getattr(args, "rotate", "none")) != "none":
+            raise ValueError("--fp4-format is not combined with weight-side rotation here.")
+        import fp4_formats as _fp4
+        args.groupsize = _fp4.block_size(args.fp4_format)
+        metadata = getattr(args, "_quantization_metadata", {})
+        metadata["fp4_format"] = {
+            "format": args.fp4_format,
+            "elements": "E2M1 {0, +-0.5, +-1, +-1.5, +-2, +-3, +-4, +-6}, round-to-nearest-even, saturating",
+            "block_size_contracting_dim": args.groupsize,
+            "scale": (
+                "one E8M0 power-of-two scale per block, X = 2^(floor(log2(amax)) - 2) (OCP MX v1.0)"
+                if args.fp4_format == "mxfp4"
+                else "FP8 E4M3 block scale (amax/6/s_tensor, RNE, clamp 448) times FP32 tensor scale s_tensor = amax(W)/(6*448); 1-D numerical NVFP4 emulation, not native Blackwell execution"
+            ),
+            "solver": "unchanged GPTQ: corrected weight -> block fake-quant -> dequantized q -> error compensation",
+            "execution": "dequantized BF16 GEMMs on RTX 4080; numerical transfer only, no hardware speed claim",
+            "quantizer_source_sha256": _source_file_sha256("fp4_formats.py"),
+        }
+        args._quantization_metadata = metadata
+    if bool(getattr(args, "rsq_attention", False)):
+        if spec.family != "qwen3_asr":
+            raise ValueError(
+                "gptq+rsqattn is a Qwen-specific matched Density control."
+            )
+        if args.method != "gptq" or args.quant_scope != "text-backbone":
+            raise ValueError(
+                "gptq+rsqattn requires GPTQ with --quant-scope text-backbone."
+            )
+        if bool(getattr(args, "qep", False)) or bool(getattr(args, "gptaq", False)):
+            raise ValueError("gptq+rsqattn is incompatible with dual-stream statistics.")
+        if not (0.0 < float(args.rsq_min_value) < float(args.rsq_max_value)):
+            raise ValueError("Require 0 < --rsq-min-value < --rsq-max-value.")
     if args.sequence_calibration:
         if spec.family != "qwen3_asr":
             raise ValueError(
@@ -2260,6 +2399,9 @@ def run(args) -> Path | None:
     args.model = spec.model_id
     args.model_family = spec.family
     args.groupsize = spec.group_size if args.groupsize == 0 else args.groupsize
+    if getattr(args, "fp4_format", "none") != "none":
+        import fp4_formats as _fp4
+        args.groupsize = _fp4.block_size(args.fp4_format)  # format block size governs the GPTQ group
     args.datasets = parse_datasets(args.datasets)
     resolve_mode(args)
     resolve_run_seeds(args)
@@ -2397,6 +2539,17 @@ def run(args) -> Path | None:
                         ),
                     }
                 )
+        reconstruction = getattr(args, "_reconstruction_stats", None)
+        if reconstruction:
+            quantization_metadata["reconstruction"] = {
+                "definition": "sum over quantized modules of ||W - Q(W)||_F^2 on the GPTQ output weights (float32)",
+                "sum_sq_error": reconstruction["sum_sq_error"],
+                "sum_sq_weight": reconstruction["sum_sq_weight"],
+                "relative_sq_error": reconstruction["sum_sq_error"] / max(reconstruction["sum_sq_weight"], 1e-30),
+                "mean_sq_error_per_weight": reconstruction["sum_sq_error"] / max(reconstruction["numel"], 1),
+                "numel": reconstruction["numel"],
+                "per_module": reconstruction["per_module"],
+            }
         if quantization_metadata:
             _write_json(run_dir / "quantization.json", quantization_metadata)
         scoring_data = None
